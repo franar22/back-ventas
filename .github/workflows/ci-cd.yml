@@ -1,0 +1,117 @@
+name: CI/CD - Backend Ventas
+on:
+  push:
+    branches:
+      - deploy
+
+jobs:
+  build-and-push:
+    name: Build & Push imagen Docker
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout codigo
+        uses: actions/checkout@v4
+      - name: Configurar Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login en Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Generar tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/back-ventas
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=sha-,format=short
+      - name: Build & Push imagen
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          dockerfile: Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy en EC2 Backend
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - name: Deploy con docker compose
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST_BACKEND }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: 22
+          command_timeout: 10m
+          script: |
+            mkdir -p ~/deploy/back-ventas && cd ~/deploy/back-ventas
+            cat > .env << ENVEOF
+            DOCKERHUB_USERNAME=${{ secrets.DOCKERHUB_USERNAME }}
+            DB_NAME_VENTAS=${{ secrets.DB_NAME_VENTAS }}
+            DB_USERNAME=${{ secrets.DB_USERNAME }}
+            DB_PASSWORD=${{ secrets.DB_PASSWORD }}
+            MYSQL_ROOT_PASSWORD=rootpassword
+            IMAGE_TAG=latest
+            ENVEOF
+            cat > docker-compose.yml << 'COMPOSEEOF'
+            services:
+              mysql-ventas:
+                image: mysql:8.0
+                container_name: mysql-ventas
+                environment:
+                  MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpassword}
+                  MYSQL_DATABASE: ${DB_NAME_VENTAS:-ventas_db}
+                  MYSQL_USER: ${DB_USERNAME:-appuser}
+                  MYSQL_PASSWORD: ${DB_PASSWORD:-apppassword}
+                volumes:
+                  - ventas_mysql_data:/var/lib/mysql
+                healthcheck:
+                  test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-prootpassword"]
+                  interval: 10s
+                  timeout: 5s
+                  retries: 10
+                  start_period: 40s
+                networks:
+                  - backend-net
+                restart: unless-stopped
+              back-ventas:
+                image: ${DOCKERHUB_USERNAME:-tuusuario}/back-ventas:${IMAGE_TAG:-latest}
+                container_name: back-ventas
+                environment:
+                  DB_ENDPOINT: mysql-ventas
+                  DB_PORT: 3306
+                  DB_NAME: ${DB_NAME_VENTAS:-ventas_db}
+                  DB_USERNAME: ${DB_USERNAME:-appuser}
+                  DB_PASSWORD: ${DB_PASSWORD:-apppassword}
+                ports:
+                  - "8080:8080"
+                depends_on:
+                  mysql-ventas:
+                    condition: service_healthy
+                healthcheck:
+                  test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health || exit 1"]
+                  interval: 30s
+                  timeout: 10s
+                  retries: 5
+                  start_period: 90s
+                networks:
+                  - backend-net
+                restart: on-failure
+            volumes:
+              ventas_mysql_data:
+                driver: local
+            networks:
+              backend-net:
+                driver: bridge
+            COMPOSEEOF
+            echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+            docker pull ${{ secrets.DOCKERHUB_USERNAME }}/back-ventas:latest
+            docker compose up -d --remove-orphans
+            sleep 10 && docker compose ps
+            docker image prune -f

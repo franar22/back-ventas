@@ -1,0 +1,61 @@
+# Docker Compose independiente - Backend Ventas
+# Permite levantar solo este servicio + su base de datos
+# Uso: docker compose up -d
+services:
+  mysql-ventas:
+    image: mysql:8.0
+    container_name: mysql-ventas
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpassword}
+      MYSQL_DATABASE: ${DB_NAME_VENTAS:-ventas_db}
+      MYSQL_USER: ${DB_USERNAME:-appuser}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-apppassword}
+    ports:
+      - "3306:3306"
+    volumes:
+      - ventas_mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-rootpassword}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - ventas-net
+    restart: unless-stopped
+
+  back-ventas:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: back-ventas
+    environment:
+      DB_ENDPOINT: mysql-ventas
+      DB_PORT: 3306
+      DB_NAME: ${DB_NAME_VENTAS:-ventas_db}
+      DB_USERNAME: ${DB_USERNAME:-appuser}
+      DB_PASSWORD: ${DB_PASSWORD:-apppassword}
+    ports:
+      - "8080:8080"
+    depends_on:
+      mysql-ventas:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    networks:
+      - ventas-net
+    restart: on-failure
+
+# Named volume: datos persisten entre reinicios de contenedor
+# Justificación: portable, gestionado por Docker, sin dependencia del path del host
+volumes:
+  ventas_mysql_data:
+    driver: local
+
+networks:
+  ventas-net:
+    driver: bridge
